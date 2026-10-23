@@ -63,6 +63,7 @@ keyswitch list
 | `keyswitch list` | Show your keys; `*` marks the one in use, with its last four characters |
 | `keyswitch use NAME` | Decrypt `NAME` with pass, run the check, write it to the target file |
 | `keyswitch add NAME` | Check a new key and store it in pass as `NAME`; `--use` also starts using it, `--force` replaces an existing one |
+| `keyswitch rm NAME` | Delete `NAME` from your pass store. Asks first (`--force` skips the question) and refuses the key in use: switch to another key first |
 | `keyswitch current` | Print the name of the key in use (exit 1 if unknown) |
 | `keyswitch test [NAME]` | Run the check on the key in use, or on `NAME` without switching |
 | `keyswitch doctor` | Show every setting, where it came from, and any problems |
@@ -75,8 +76,10 @@ check cannot run (offline, timeout); a key the check rejects is still refused.
 (leading and trailing spaces are dropped), so scripts can pipe a key in. With
 `--use` it writes the target from the key it was just given, so it needs no
 passphrase. Keys stored with `pass insert` work too, as long as the secret is
-on the first line. Removing and renaming keys is done with `pass` itself
-(`pass rm`, `pass mv`).
+on the first line. Renaming a key is done with `pass mv`.
+
+`rm` never decrypts anything. Without a terminal to ask on, it deletes only
+with `--force`.
 
 ## Configuration
 
@@ -197,8 +200,9 @@ What it does not do:
   must for your program to work.
 - Your pass store is only as strong as your GnuPG passphrase. A key with no
   passphrase protects nothing.
-- Deleting a key with `pass rm` removes your copy only. It does not revoke
-  the key with whoever issued it.
+- Deleting a key (`keyswitch rm` or `pass rm`) removes your copy only. It
+  does not revoke the key with whoever issued it. If your pass store is a git
+  repository, the encrypted key also stays in its history.
 - The permission checks read classic Unix mode bits. They see POSIX ACLs
   through the mask (so a folder with an ACL may look group-writable even when
   only named users can write), but not NFSv4 or GPFS ACLs, which some shared

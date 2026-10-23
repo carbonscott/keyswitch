@@ -519,6 +519,69 @@ chmod 600 "$TARGET"
 run env KEYSWITCH_PASS=/nonexistent/pass "$KS" doctor
 check "doctor reports a missing pass program" out_has "✗"
 
+# ------------------------------------------------------------ rm
+
+run "$KS" -s svc rm off2 </dev/null
+check "rm without a terminal asks for --force" err_has "--force"
+check "and deletes nothing" [ -e "$HOME/.password-store/svc/off2.gpg" ]
+run env KEYSWITCH_PASS="$T/nodecrypt/pass" "$KS" -s svc rm off2 --force
+check "rm --force deletes the key" rc_is 0
+check "from the pass store" [ ! -e "$HOME/.password-store/svc/off2.gpg" ]
+check "without decrypting anything" [ "${ERR#*decryption attempted}" = "$ERR" ]
+check "and says the key itself still works" out_has "revokes it"
+run "$KS" -s svc list
+check "list no longer shows it" out_lacks "off2"
+check "and still marks the key in use" out_has "* newkey"
+
+run "$KS" -s svc rm newkey --force
+check "rm refuses the key in use, even with --force" rc_is 1
+check "and says to switch first" err_has "switch to another key first"
+check "the key stays in pass" [ -e "$HOME/.password-store/svc/newkey.gpg" ]
+check "and in the target" file_is "$TARGET" "sk-test-new2-0008"
+
+run "$KS" -s svc rm missing --force
+check "rm of an unknown key fails" rc_is 1
+check "and lists the available keys" err_has "personal"
+run "$KS" -s svc rm ../escape --force
+check "rm refuses a path-like name (usage error)" rc_is 2
+run "$KS" -s svc rm
+check "rm needs a NAME (usage error)" rc_is 2
+run "$KS" -s svc rm personal --use
+check "--use with rm is a usage error" rc_is 2
+check "and deletes nothing" [ -e "$HOME/.password-store/svc/personal.gpg" ]
+run "$KS" -s svc use personal --force
+check "--force with use is still a usage error" rc_is 2
+
+add svc/team/a 'sk-test-team-0014'
+run "$KS" -s svc remove team/a --force
+check "rm deletes a nested key ('remove' works too)" [ ! -e "$HOME/.password-store/svc/team/a.gpg" ]
+check "and leaves the others" [ -e "$HOME/.password-store/svc/personal.gpg" ]
+
+# On a terminal rm asks first. `script` provides the terminal.
+# shellcheck disable=SC2016  # $a is expanded by the shell that script runs
+if printf 'y\n' | script -qec 'read -r a; [ -t 0 ] && echo "tty:$a"' /dev/null 2>/dev/null | grep -q 'tty:y'; then
+  tty_rm() {
+    OUT=$(printf '%s\n' "$1" | script -qec "$(printf '%q ' "$KS" -s svc rm "$2")" /dev/null 2>&1)
+    RC=$?
+    ERR=$OUT
+  }
+  add svc/tty1 'sk-test-tty-0015'
+  tty_rm n tty1
+  check "on a terminal rm asks first" out_has "[y/N]"
+  check "an answer other than y deletes nothing" [ -e "$HOME/.password-store/svc/tty1.gpg" ]
+  check "and exits 1" rc_is 1
+  tty_rm '' tty1
+  check "Enter alone means no" [ -e "$HOME/.password-store/svc/tty1.gpg" ]
+  tty_rm y tty1
+  check "y deletes it" [ ! -e "$HOME/.password-store/svc/tty1.gpg" ]
+  check "and exits 0" rc_is 0
+  tty_rm y newkey
+  check "the key in use is refused before anything is asked" out_lacks "[y/N]"
+  check "and stays in pass" [ -e "$HOME/.password-store/svc/newkey.gpg" ]
+else
+  echo "skip rm confirmation tests (no 'script' to provide a terminal)"
+fi
+
 # ------------------------------------------------------------ keyswitch-check-http
 
 run "$CHECK_HTTP"

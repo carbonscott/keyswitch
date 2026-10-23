@@ -19,7 +19,7 @@ umask 077
 # them, bash would keep the export flag and hand the key to every child process.
 unset -v key content out line SECRET TARGET_KEY
 
-readonly KEYSWITCH_VERSION="0.1.0"
+readonly KEYSWITCH_VERSION="0.2.0"
 PROG=${0##*/}
 
 # ---------------------------------------------------------------- messages
@@ -43,6 +43,7 @@ Usage:
   $PROG use NAME          decrypt NAME with pass, check it, write it to the target file
   $PROG add NAME          check a new key and store it in pass as NAME (reads it hidden
                           from the terminal, or the first line of stdin)
+  $PROG rm NAME           delete NAME from pass (asks first; refuses the key in use)
   $PROG current           print the name of the key in use
   $PROG test [NAME]       run the check on the key in use (or on NAME, without switching)
   $PROG doctor            show every setting, where it came from, and any problems
@@ -52,7 +53,8 @@ Options:
   -s, --service NAME      which service; needed only when several are configured
       --allow-unchecked   with 'use' or 'add': go ahead even when the check cannot run
                           (a key the check rejects is still refused)
-      --force             with 'add': replace an existing key of that name
+      --force             with 'add': replace an existing key of that name;
+                          with 'rm': delete without asking
       --use               with 'add': also start using it (no decryption needed)
 
 Keys are ordinary pass entries inside the service's 'entries' folder:
@@ -810,6 +812,46 @@ cmd_add() {
   fi
 }
 
+refuse_if_active() {
+  find_active
+  if [[ $ACTIVE == "$1" ]]; then
+    die "'$1' is the key in use ($(tildify "$SVC_TARGET") holds a copy of it); switch to another key first with '$PROG use NAME', then delete it"
+  fi
+}
+
+# Delete a key from the pass store. The key in use is refused: its copy in the
+# target file would outlive it, with nothing stored to switch back to.
+# Nothing is decrypted.
+cmd_rm() {
+  local name=$1 entry ans=''
+  valid_entry_path "$name" || usage_error "bad key name '$name'"
+  setup_service
+  resolve_pass
+  require_store
+  require_entry "$name"
+  entry=$SVC_PREFIX$name
+  refuse_if_active "$name"
+  if (( ! OPT_FORCE )); then
+    [[ -t 0 ]] || die "not deleting '$name': there is no terminal to confirm on. To delete it without asking, add --force"
+    printf "Delete '%s' (%s in %s)? [y/N] " "$name" "$entry" "$(tildify "$SVC_STORE")" >&2
+    IFS= read -r ans || ans=''
+    case $ans in
+      y|Y|yes|Yes|YES) ;;
+      *) die "nothing deleted" ;;
+    esac
+  fi
+  # Lock only after the answer, so a forgotten prompt blocks nobody; then look
+  # again, in case a switch to this key finished in the meantime.
+  ensure_private_dir "$STATE_DIR" "state folder"
+  take_lock
+  refuse_if_active "$name"
+  if ! PASSWORD_STORE_DIR=$SVC_STORE "$PASS_BIN" rm -f "$entry" >/dev/null 9>&-; then
+    die "pass could not delete '$entry'"
+  fi
+  [[ ! -e $SVC_STORE/$entry.gpg ]] || die "pass did not delete $(tildify "$SVC_STORE/$entry.gpg")"
+  say "✓ $SVC_NAME: deleted '$name'. This removes your copy only; the key itself works until whoever issued it revokes it."
+}
+
 cmd_current() {
   setup_service
   find_active
@@ -1054,7 +1096,9 @@ main() {
   cmd=$1
   shift
   if (( OPT_ALLOW_UNCHECKED )) && [[ $cmd != use && $cmd != add ]]; then usage_error "--allow-unchecked only applies to 'use' and 'add'"; fi
-  if (( OPT_FORCE || OPT_USE )) && [[ $cmd != add ]]; then usage_error "--force and --use only apply to 'add'"; fi
+  if [[ $cmd == remove ]]; then cmd='rm'; fi
+  if (( OPT_FORCE )) && [[ $cmd != add && $cmd != rm ]]; then usage_error "--force only applies to 'add' and 'rm'"; fi
+  if (( OPT_USE )) && [[ $cmd != add ]]; then usage_error "--use only applies to 'add'"; fi
   init_dirs
   case $cmd in
     list|ls)
@@ -1068,6 +1112,10 @@ main() {
     add)
       (( $# == 1 )) || usage_error "usage: $PROG add NAME [--force] [--use]"
       cmd_add "$1"
+      ;;
+    rm)
+      (( $# == 1 )) || usage_error "usage: $PROG rm NAME [--force]"
+      cmd_rm "$1"
       ;;
     current)
       (( $# == 0 )) || usage_error "'current' takes no arguments"
