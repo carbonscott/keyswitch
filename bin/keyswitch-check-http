@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# keyswitch-check-http URL HEADER [VALUE_PREFIX]
+#
+# A ready-made `check` command for keyswitch. Reads a key on stdin and asks
+# URL whether it accepts the key, sent in the HTTP header HEADER. Examples:
+#
+#   check = keyswitch-check-http https://api.example.com/v1/models x-api-key
+#   check = keyswitch-check-http https://api.example.com/v1/models Authorization 'Bearer '
+#
+# The key reaches curl on stdin (curl -H @-), never on a command line, so it
+# does not show up in `ps` or in shell history. curl runs with -q, so your
+# ~/.curlrc cannot make it follow redirects (sending the key elsewhere) or
+# print the request. Redirects are never followed.
+#
+# Only https:// is allowed, except plain http:// to this machine itself
+# (127.0.0.1, [::1] or localhost), which also bypasses any proxy, so a key
+# never crosses a network unencrypted.
+#
+# Exit status: 0 accepted (HTTP 2xx), 1 rejected (HTTP 401 or 403),
+# 3 could not check (no answer, another status, or bad arguments).
+# Set KEYSWITCH_CHECK_TIMEOUT to change the 20-second limit.
+
+set -u
+# Holds the key below; never let an exported copy reach curl's environment.
+unset -v key
+
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: ${0##*/} URL HEADER [VALUE_PREFIX]   (the key is read from stdin)" >&2
+  exit 3
+fi
+url=$1
+header=$2
+prefix=${3:-}
+
+noproxy=()
+case $url in
+  https://*) proto='=https' ;;
+  http://*)
+    hostport=${url#http://}
+    hostport=${hostport%%/*}
+    if [[ ! $hostport =~ ^(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$ ]]; then
+      echo "${0##*/}: refusing to send a key over plain http to $hostport; use https://" >&2
+      exit 3
+    fi
+    proto='=http'
+    noproxy=(--noproxy '*')
+    ;;
+  *) echo "${0##*/}: URL must start with https://" >&2; exit 3 ;;
+esac
+if [[ ! $header =~ ^[A-Za-z0-9-]+$ ]]; then
+  echo "${0##*/}: bad header name '$header'" >&2
+  exit 3
+fi
+if [[ $prefix == *[$'\r\n']* ]]; then
+  echo "${0##*/}: VALUE_PREFIX may not contain line breaks" >&2
+  exit 3
+fi
+
+key=''
+IFS= read -r key || [[ -n $key ]] || { echo "${0##*/}: no key on stdin" >&2; exit 3; }
+key=${key%$'\r'}
+[[ -n $key ]] || { echo "${0##*/}: empty key on stdin" >&2; exit 3; }
+
+code=$(printf '%s: %s%s\n' "$header" "$prefix" "$key" |
+  curl -q -s -o /dev/null -w '%{http_code}' --proto "$proto" "${noproxy[@]+"${noproxy[@]}"}" \
+    --max-time "${KEYSWITCH_CHECK_TIMEOUT:-20}" -H @- "$url")
+[[ $code =~ ^[0-9]{3}$ ]] || code=000
+
+case $code in
+  2??) exit 0 ;;
+  401|403) echo "${0##*/}: $url rejected the key (HTTP $code)" >&2; exit 1 ;;
+  000) echo "${0##*/}: could not reach $url" >&2; exit 3 ;;
+  *) echo "${0##*/}: unexpected answer from $url (HTTP $code)" >&2; exit 3 ;;
+esac

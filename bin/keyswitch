@@ -1,0 +1,1089 @@
+#!/usr/bin/env bash
+# keyswitch: switch which key a program reads, keeping your keys in pass.
+#
+# Your keys live encrypted in pass (https://www.passwordstore.org/). A program,
+# for example an AI coding agent, reads its key from one fixed file. Running
+# `keyswitch use NAME` decrypts that one key with pass, optionally checks it,
+# and writes it to the fixed file (mode 600) in a single atomic step.
+#
+# Nothing about any particular service is built in. Every path, the pass
+# program and the check command come from configuration, environment
+# variables or documented defaults; `keyswitch doctor` shows which one won.
+#
+# https://github.com/carbonscott/keyswitch
+
+set -euo pipefail
+umask 077
+
+# These names hold key material below. If the caller happened to export any of
+# them, bash would keep the export flag and hand the key to every child process.
+unset -v key content out line SECRET TARGET_KEY
+
+readonly KEYSWITCH_VERSION="0.1.0"
+PROG=${0##*/}
+
+# ---------------------------------------------------------------- messages
+
+say()  { printf '%s\n' "$*"; }
+err()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+warn() { printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+usage_error() {
+  err "$*"
+  printf "Run '%s --help' for usage.\n" "$PROG" >&2
+  exit 2
+}
+
+usage() {
+  cat <<EOF
+$PROG $KEYSWITCH_VERSION: switch which key a program reads, keeping your keys in pass.
+
+Usage:
+  $PROG list              show your keys; * marks the one in use
+  $PROG use NAME          decrypt NAME with pass, check it, write it to the target file
+  $PROG add NAME          check a new key and store it in pass as NAME (reads it hidden
+                          from the terminal, or the first line of stdin)
+  $PROG current           print the name of the key in use
+  $PROG test [NAME]       run the check on the key in use (or on NAME, without switching)
+  $PROG doctor            show every setting, where it came from, and any problems
+  $PROG help | --version
+
+Options:
+  -s, --service NAME      which service; needed only when several are configured
+      --allow-unchecked   with 'use' or 'add': go ahead even when the check cannot run
+                          (a key the check rejects is still refused)
+      --force             with 'add': replace an existing key of that name
+      --use               with 'add': also start using it (no decryption needed)
+
+Keys are ordinary pass entries inside the service's 'entries' folder:
+  pass insert myservice/personal
+
+Configuration (all optional except the two required service settings):
+  <config>/config         pass = PROGRAM          which pass to run (default: pass on PATH)
+                          default_service = NAME
+                          trusted_dirs = DIR:DIR  folders others can change that you trust
+                                                  on the path to pass or the check
+  <config>/NAME.conf      entries = myservice/    pass folder holding this service's keys (required)
+                          target = ~/path/key     file your program reads its key from (required)
+                          check = COMMAND ARGS    one command (no pipes, \$ or redirections);
+                                                  gets the key on stdin; exit 0 accept,
+                                                  1 reject, anything else = could not check
+                          store_dir = DIR         pass store to use (default: pass's own)
+                          message = TEXT          printed after a successful switch
+  <config> is \$KEYSWITCH_CONFIG_DIR, else \$XDG_CONFIG_HOME/keyswitch, else ~/.config/keyswitch.
+  pass, target, store_dir and trusted_dirs may use ~ and \$VARS (unset or empty is an
+  error). Comments go on their own line, starting with #.
+
+Environment:
+  KEYSWITCH_PASS, KEYSWITCH_SERVICE, KEYSWITCH_CONFIG_DIR, KEYSWITCH_STATE_DIR,
+  PASSWORD_STORE_DIR (pass's own), XDG_CONFIG_HOME, XDG_STATE_HOME
+EOF
+}
+
+# ---------------------------------------------------------------- helpers
+
+CLEANUP=()
+cleanup() {
+  local f
+  for f in "${CLEANUP[@]+"${CLEANUP[@]}"}"; do rm -f -- "$f"; done
+}
+trap cleanup EXIT
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+# Show a path with $HOME abbreviated, for messages only.
+tildify() {
+  local tilde='~'
+  if [[ $1 == "$HOME" ]]; then printf '%s' "$tilde"
+  elif [[ $1 == "$HOME"/* ]]; then printf '%s/%s' "$tilde" "${1#"$HOME"/}"
+  else printf '%s' "$1"; fi
+}
+
+# Expand a leading ~ and $VAR / ${VAR} references, without eval. An unset or
+# empty variable is an error: guessing would write keys to the wrong place.
+# Expanded text is never expanded again.
+expand_path() {
+  local s=$1 out='' name tilde='~'
+  if [[ $s == "$tilde" ]]; then
+    out=$HOME
+    s=''
+  elif [[ $s == "$tilde"/* ]]; then
+    out=$HOME/
+    s=${s#"$tilde"/}
+  fi
+  while [[ $s == *'$'* ]]; do
+    out+=${s%%\$*}
+    s=${s#*\$}
+    if [[ $s == '{'* ]]; then
+      [[ $s == *'}'* ]] || die "unterminated \${ in '$1'"
+      name=${s#\{}
+      name=${name%%\}*}
+      s=${s#*\}}
+    else
+      name=${s%%[!A-Za-z0-9_]*}
+      s=${s#"$name"}
+    fi
+    [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "bad variable reference in '$1'"
+    [[ -n ${!name:-} ]] || die "'$1' uses \$$name, which is not set or is empty"
+    out+=${!name}
+  done
+  printf '%s' "$out$s"
+}
+
+# A pass entry path: segments of letters, digits and ._@+- , each starting
+# with a letter or digit, so no '..' segment, no leading '-' and no absolute path.
+valid_entry_path() {
+  local re='^[A-Za-z0-9][A-Za-z0-9._@+-]*(/[A-Za-z0-9][A-Za-z0-9._@+-]*)*$'
+  [[ $1 =~ $re ]]
+}
+
+mode_and_owner() {
+  stat -L -c '%a %u' -- "$1" 2>/dev/null || stat -L -f '%Lp %u' -- "$1" 2>/dev/null
+}
+
+# Refuse a file or folder that someone else owns or can change: its contents
+# decide where keys are written and which command runs on them.
+assert_private() {
+  local path=$1 what=$2 info mode owner
+  info=$(mode_and_owner "$path") || die "cannot inspect $what $(tildify "$path")"
+  mode=${info% *}
+  owner=${info#* }
+  if [[ $owner != "$MY_UID" && $owner != 0 ]]; then
+    die "$what $(tildify "$path") belongs to uid $owner, not to you; refusing to use it"
+  fi
+  if (( 8#$mode & 8#022 )); then
+    die "$what $(tildify "$path") can be changed by other users (mode $mode); refusing to use it. Fix: chmod go-w '$path'"
+  fi
+}
+
+# Is DIR listed in trusted_dirs? (Exact match, as given or resolved.)
+is_trusted_dir() {
+  local d
+  for d in "${TRUSTED_DIRS[@]+"${TRUSTED_DIRS[@]}"}"; do
+    if [[ $1 == "$d" ]]; then return 0; fi
+  done
+  return 1
+}
+
+# Check one folder on the way to a program that will see a key. Sets STICKY_OPEN
+# when the folder is writable by others but sticky (like /tmp): then the next
+# entry must belong to you or root, or someone else could have put it there.
+check_chain_dir() {
+  local dir=$1 what=$2 info mode gid
+  STICKY_OPEN=0
+  info=$(stat -L -c '%a %g' -- "$dir" 2>/dev/null || stat -L -f '%Lp %g' -- "$dir" 2>/dev/null) ||
+    die "cannot inspect $(tildify "$dir"), on the path to $what"
+  mode=${info% *}
+  gid=${info#* }
+  if is_trusted_dir "$dir"; then
+    # Trusting a sticky, world-writable folder (like /tmp) still does not
+    # trust whatever strangers create inside it.
+    if (( 8#$mode & 8#002 && 8#$mode & 8#1000 )); then STICKY_OPEN=1; fi
+    return 0
+  fi
+  if (( 8#$mode & 8#002 )) || { (( 8#$mode & 8#020 )) && [[ $gid != 0 ]]; }; then
+    if (( 8#$mode & 8#1000 )); then
+      STICKY_OPEN=1
+      return 0
+    fi
+    die "$what: the folder $(tildify "$dir") on its path can be changed by other users (mode $mode), so someone could swap the program. If you trust everyone who can change that folder, add it to trusted_dirs in $(tildify "$GLOBAL_FILE")"
+  fi
+}
+
+# Walk every folder from / down to PATH, then the entry PATH itself.
+walk_path() {
+  local path=$1 what=$2 cur='' i last o
+  local -a parts=()
+  check_chain_dir / "$what"
+  IFS=/ read -r -a parts <<<"${path#/}"
+  last=$(( ${#parts[@]} - 1 ))
+  for (( i = 0; i <= last; i++ )); do
+    [[ -n ${parts[$i]} ]] || continue
+    cur=$cur/${parts[$i]}
+    if (( STICKY_OPEN )); then
+      o=$(stat -c '%u' -- "$cur" 2>/dev/null || stat -f '%u' -- "$cur" 2>/dev/null) ||
+        die "cannot inspect $(tildify "$cur"), on the path to $what"
+      if [[ $o != "$MY_UID" && $o != 0 ]]; then
+        die "$what: $(tildify "$cur") sits in a folder anyone can write to and belongs to uid $o, not to you or root"
+      fi
+    fi
+    if (( i < last )); then check_chain_dir "$cur" "$what"; fi
+  done
+}
+
+# Refuse a program that someone else could replace, because it will see your
+# keys. Every folder on its path, both as given and with symlinks resolved,
+# must be writable only by its owner (root's group is fine too); a sticky
+# folder such as /tmp is fine when the entry in it is yours or root's; folders
+# listed in trusted_dirs are accepted as they are. The file itself must not be
+# writable by others. Owners may be anyone, as with any shared install.
+# Sets VETTED to the resolved path, which is what callers then run.
+assert_trusted_program() {
+  local path=$1 what=$2 real info mode gid
+  [[ $path == /* ]] || die "$what '$path' must be an absolute path"
+  real=$(readlink -f -- "$path" 2>/dev/null) || real=$path
+  walk_path "$path" "$what"
+  if [[ $real != "$path" ]]; then walk_path "$real" "$what"; fi
+  info=$(stat -L -c '%a %g' -- "$real" 2>/dev/null || stat -L -f '%Lp %g' -- "$real" 2>/dev/null) ||
+    die "cannot inspect $what $(tildify "$real")"
+  mode=${info% *}
+  gid=${info#* }
+  if (( 8#$mode & 8#002 )) || { (( 8#$mode & 8#020 )) && [[ $gid != 0 ]]; }; then
+    die "$what $(tildify "$real") can be changed by other users (mode $mode); refusing to run it"
+  fi
+  VETTED=$real
+}
+
+# Create DIR if needed (mode 700, from the umask) and refuse one that someone
+# else owns or can change: keys and the record of which key is in use go here.
+ensure_private_dir() {
+  if [[ ! -d $1 ]]; then mkdir -p -- "$1" || die "cannot create $(tildify "$1")"; fi
+  assert_private "$1" "$2"
+}
+
+sha256_hex() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+  else openssl dgst -sha256 | sed 's/^.*= //'
+  fi
+}
+
+# Short, one-way fingerprint so `current` can tell whether the target file
+# still holds what keyswitch wrote. The key itself is never stored.
+fingerprint() { printf '%s' "$1" | sha256_hex | cut -c1-16; }
+
+# Last four characters, only for keys long enough that this reveals little.
+hint_of() {
+  if (( ${#1} >= 12 )); then printf '…%s' "${1: -4}"; fi
+}
+
+# Write CONTENT to PATH through a temp file in the same folder, flush it to
+# disk, then rename. The rename replaces a symlink at PATH (even one pointing
+# at a folder) and never writes through it. A real folder at PATH is refused.
+atomic_write() {
+  local path=$1 content=$2 dir tmp
+  dir=$(dirname -- "$path")
+  ensure_private_dir "$dir" "folder"
+  if [[ -d $path && ! -L $path ]]; then die "$(tildify "$path") is a folder, not a file"; fi
+  tmp=$(mktemp "$dir/.keyswitch.XXXXXXXX")
+  CLEANUP+=("$tmp")
+  printf '%s\n' "$content" > "$tmp"
+  chmod 600 -- "$tmp"
+  sync -- "$tmp" 2>/dev/null || true
+  if mv --version >/dev/null 2>&1; then
+    mv -fT -- "$tmp" "$path"
+  else
+    mv -fh -- "$tmp" "$path"
+  fi
+}
+
+# ---------------------------------------------------------------- config
+
+# parse_config FILE KEY... : read 'key = value' lines into CFG_KEYS / CFG_VALS.
+parse_config() {
+  local file=$1 line key val n=0 i where
+  shift
+  local allowed=" $* "
+  CFG_KEYS=()
+  CFG_VALS=()
+  assert_private "$file" "config file"
+  where=$(tildify "$file")
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=$(trim "${line%$'\r'}")
+    [[ -z $line || $line == '#'* ]] && continue
+    if [[ $line != *=* ]]; then
+      die "$where:$n: expected 'name = value', got: $line"
+    fi
+    key=$(trim "${line%%=*}")
+    val=$(trim "${line#*=}")
+    if [[ ! $key =~ ^[a-z_]+$ ]]; then die "$where:$n: bad setting name '$key'"; fi
+    if [[ $allowed != *" $key "* ]]; then
+      warn "$where:$n: unknown setting '$key' is ignored"
+      continue
+    fi
+    for (( i = 0; i < ${#CFG_KEYS[@]}; i++ )); do
+      if [[ ${CFG_KEYS[$i]} == "$key" ]]; then die "$where:$n: '$key' is set twice"; fi
+    done
+    CFG_KEYS+=("$key")
+    CFG_VALS+=("$val")
+  done < "$file"
+}
+
+cfg_get() {
+  local i
+  for (( i = 0; i < ${#CFG_KEYS[@]}; i++ )); do
+    if [[ ${CFG_KEYS[$i]} == "$1" ]]; then printf '%s' "${CFG_VALS[$i]}"; return 0; fi
+  done
+  return 1
+}
+
+init_dirs() {
+  [[ -n ${HOME:-} ]] || die "HOME is not set"
+  MY_UID=$(id -u)
+  if [[ -n ${KEYSWITCH_CONFIG_DIR:-} ]]; then
+    CONFIG_DIR=$(expand_path "$KEYSWITCH_CONFIG_DIR") || exit 1
+    CONFIG_DIR_ORIGIN="KEYSWITCH_CONFIG_DIR"
+  elif [[ ${XDG_CONFIG_HOME:-} == /* ]]; then
+    CONFIG_DIR=$XDG_CONFIG_HOME/keyswitch
+    CONFIG_DIR_ORIGIN="default (XDG_CONFIG_HOME)"
+  else
+    CONFIG_DIR=$HOME/.config/keyswitch
+    CONFIG_DIR_ORIGIN="default"
+  fi
+  if [[ -n ${KEYSWITCH_STATE_DIR:-} ]]; then
+    STATE_DIR=$(expand_path "$KEYSWITCH_STATE_DIR") || exit 1
+    STATE_DIR_ORIGIN="KEYSWITCH_STATE_DIR"
+  elif [[ ${XDG_STATE_HOME:-} == /* ]]; then
+    STATE_DIR=$XDG_STATE_HOME/keyswitch
+    STATE_DIR_ORIGIN="default (XDG_STATE_HOME)"
+  else
+    STATE_DIR=$HOME/.local/state/keyswitch
+    STATE_DIR_ORIGIN="default"
+  fi
+  GLOBAL_FILE=$CONFIG_DIR/config
+}
+
+GLOBAL_LOADED=0
+load_global() {
+  (( GLOBAL_LOADED )) && return 0
+  GLOBAL_PASS=''
+  GLOBAL_PASS_SET=0
+  GLOBAL_DEFAULT_SERVICE=''
+  TRUSTED_DIRS=()
+  local v d real
+  local -a dirs=()
+  if [[ -d $CONFIG_DIR ]]; then assert_private "$CONFIG_DIR" "config folder"; fi
+  if [[ -f $GLOBAL_FILE ]]; then
+    parse_config "$GLOBAL_FILE" pass default_service trusted_dirs
+    if GLOBAL_PASS=$(cfg_get pass); then GLOBAL_PASS_SET=1; fi
+    GLOBAL_DEFAULT_SERVICE=$(cfg_get default_service || true)
+    v=$(cfg_get trusted_dirs || true)
+    if [[ -n $v ]]; then
+      IFS=: read -r -a dirs <<<"$v"
+      for d in "${dirs[@]}"; do
+        d=$(trim "$d")
+        [[ -n $d ]] || continue
+        d=$(expand_path "$d") || exit 1
+        [[ $d == /* ]] || die "$(tildify "$GLOBAL_FILE"): trusted_dirs entries must be absolute paths (got '$d')"
+        [[ $d == / ]] || d=${d%/}
+        TRUSTED_DIRS+=("$d")
+        real=$(readlink -f -- "$d" 2>/dev/null || true)
+        if [[ -n $real && $real != "$d" ]]; then TRUSTED_DIRS+=("$real"); fi
+      done
+    fi
+  fi
+  GLOBAL_LOADED=1
+}
+
+list_services() {
+  local f
+  [[ -d $CONFIG_DIR ]] || return 0
+  for f in "$CONFIG_DIR"/*.conf; do
+    [[ -e $f ]] || continue
+    f=${f##*/}
+    printf '%s\n' "${f%.conf}"
+  done
+}
+
+resolve_service() {
+  local -a names=()
+  local n
+  if [[ -n $OPT_SERVICE ]]; then
+    SVC_NAME=$OPT_SERVICE
+  elif [[ -n ${KEYSWITCH_SERVICE:-} ]]; then
+    SVC_NAME=$KEYSWITCH_SERVICE
+  elif [[ -n $GLOBAL_DEFAULT_SERVICE ]]; then
+    SVC_NAME=$GLOBAL_DEFAULT_SERVICE
+  else
+    while IFS= read -r n; do names+=("$n"); done < <(list_services)
+    case ${#names[@]} in
+      0) die "no services configured yet: create $(tildify "$CONFIG_DIR")/NAME.conf (see '$PROG --help')" ;;
+      1) SVC_NAME=${names[0]} ;;
+      *) die "several services are configured (${names[*]}); choose one with -s NAME, KEYSWITCH_SERVICE, or default_service in $(tildify "$GLOBAL_FILE")" ;;
+    esac
+  fi
+  if [[ ! $SVC_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then usage_error "bad service name '$SVC_NAME'"; fi
+}
+
+load_service() {
+  local v
+  SVC_FILE=$CONFIG_DIR/$SVC_NAME.conf
+  [[ -f $SVC_FILE ]] || die "service '$SVC_NAME' is not configured: $(tildify "$SVC_FILE") does not exist"
+  parse_config "$SVC_FILE" entries target check store_dir message
+
+  v=$(cfg_get entries) || die "$(tildify "$SVC_FILE"): 'entries' is required (the pass folder holding this service's keys, e.g. entries = $SVC_NAME/)"
+  v=${v#/}
+  v=${v%/}
+  valid_entry_path "$v" || die "$(tildify "$SVC_FILE"): bad 'entries' value '$v'"
+  SVC_PREFIX=$v/
+
+  v=$(cfg_get target || true)
+  [[ -n $v ]] || die "$(tildify "$SVC_FILE"): 'target' is required (the file your program reads its key from)"
+  SVC_TARGET=$(expand_path "$v") || exit 1
+  [[ $SVC_TARGET == /* ]] || die "$(tildify "$SVC_FILE"): 'target' must be an absolute path or start with ~ (got '$v')"
+
+  SVC_CHECK=$(cfg_get check || true)
+  SVC_MESSAGE=$(cfg_get message || true)
+
+  v=$(cfg_get store_dir || true)
+  if [[ -n $v ]]; then
+    SVC_STORE=$(expand_path "$v") || exit 1
+    SVC_STORE_ORIGIN="store_dir in $(tildify "$SVC_FILE")"
+  elif [[ -n ${PASSWORD_STORE_DIR:-} ]]; then
+    SVC_STORE=$PASSWORD_STORE_DIR
+    SVC_STORE_ORIGIN="PASSWORD_STORE_DIR"
+  else
+    SVC_STORE=$HOME/.password-store
+    SVC_STORE_ORIGIN="default (pass)"
+  fi
+  SVC_STATE=$STATE_DIR/$SVC_NAME.state
+}
+
+setup_service() {
+  load_global
+  resolve_service
+  load_service
+}
+
+resolve_pass() {
+  local v origin
+  load_global
+  if [[ -n ${KEYSWITCH_PASS:-} ]]; then
+    v=$KEYSWITCH_PASS
+    origin="KEYSWITCH_PASS"
+  elif (( GLOBAL_PASS_SET )); then
+    v=$GLOBAL_PASS
+    origin="pass in $(tildify "$GLOBAL_FILE")"
+  else
+    v=pass
+    origin="default (PATH)"
+  fi
+  [[ -n $v ]] || die "the pass program is set to an empty value ($origin)"
+  v=$(expand_path "$v") || exit 1
+  if [[ $v == */* ]]; then
+    [[ -f $v && -x $v ]] || die "the pass program '$v' (from $origin) is not an executable file"
+    PASS_BIN=$v
+  else
+    PASS_BIN=$(type -P "$v") || die "cannot find '$v' on PATH. Install pass, or point to it with KEYSWITCH_PASS=/path/to/pass or 'pass = /path/to/pass' in $(tildify "$GLOBAL_FILE")"
+  fi
+  PASS_ORIGIN=$origin
+  assert_trusted_program "$PASS_BIN" "the pass program"
+  PASS_BIN=$VETTED
+}
+
+# Split the check setting into words the way the shell does for one plain
+# command: '...' and "..." group words and nothing inside them is expanded, a
+# backslash keeps the next character, and a ~ starting an unquoted word means
+# your home folder. Shell operators, $ and backquotes are refused: a check is
+# exactly one command, so what keyswitch vets is exactly what runs.
+parse_check() {
+  local s=$1 n=${#1} i=0 c word='' have=0 tilde_ok=0 part rest
+  CHECK_ARGV=()
+  while (( i < n )); do
+    c=${s:i:1}
+    case $c in
+      ' '|$'\t')
+        if (( have )); then push_check_word "$word" "$tilde_ok"; fi
+        word=''
+        have=0
+        tilde_ok=0
+        ;;
+      "'")
+        rest=${s:i+1}
+        [[ $rest == *"'"* ]] || die "check: unmatched ' in: $s"
+        part=${rest%%"'"*}
+        word+=$part
+        have=1
+        i=$(( i + ${#part} + 1 ))
+        ;;
+      '"')
+        i=$(( i + 1 ))
+        while (( i < n )) && [[ ${s:i:1} != '"' ]]; do
+          c=${s:i:1}
+          if [[ $c == $'\\' ]] && (( i + 1 < n )) && [[ ${s:i+1:1} == '"' || ${s:i+1:1} == $'\\' ]]; then
+            i=$(( i + 1 ))
+            c=${s:i:1}
+          elif [[ $c == '$' || $c == '`' ]]; then
+            die "check: \$ and \` are not allowed, even in quotes (nothing is expanded): $s"
+          fi
+          word+=$c
+          i=$(( i + 1 ))
+        done
+        (( i < n )) || die "check: unmatched \" in: $s"
+        have=1
+        ;;
+      $'\\')
+        (( i + 1 < n )) || die "check: a backslash at the end of: $s"
+        i=$(( i + 1 ))
+        word+=${s:i:1}
+        have=1
+        ;;
+      ';'|'&'|'|'|'<'|'>'|'('|')'|'$'|'`')
+        die "check: '$c' is not allowed. A check is one command with arguments; put anything more complex in a script and point check at it: $s"
+        ;;
+      *)
+        if (( ! have )) && [[ $c == '~' ]]; then tilde_ok=1; fi
+        word+=$c
+        have=1
+        ;;
+    esac
+    i=$(( i + 1 ))
+  done
+  if (( have )); then push_check_word "$word" "$tilde_ok"; fi
+  (( ${#CHECK_ARGV[@]} )) || die "check is empty"
+}
+
+push_check_word() {
+  local w=$1 tilde='~'
+  if (( $2 )); then
+    if [[ $w == "$tilde" ]]; then w=$HOME
+    elif [[ $w == "$tilde"/* ]]; then w=$HOME/${w#"$tilde"/}
+    fi
+  fi
+  CHECK_ARGV+=("$w")
+}
+
+# Before the check sees a key, vet everything it could run: the command itself
+# and every argument that is an absolute path to an existing file (a script
+# given to an interpreter, for example). Relative paths are refused because
+# they depend on the folder you happen to be in. Code passed inline (bash -c,
+# python -c) cannot be inspected.
+vet_check() {
+  local i a
+  parse_check "$SVC_CHECK"
+  a=${CHECK_ARGV[0]}
+  if [[ $a == /* ]]; then
+    [[ -f $a && -x $a ]] || die "the check program '$a' is not an executable file"
+  elif [[ $a == */* ]]; then
+    die "the check program '$a' is a relative path; use an absolute path or a command name"
+  else
+    a=$(type -P "$a") || die "cannot find the check program '${CHECK_ARGV[0]}' on PATH"
+  fi
+  assert_trusted_program "$a" "the check program"
+  CHECK_ARGV[0]=$VETTED
+  for (( i = 1; i < ${#CHECK_ARGV[@]}; i++ )); do
+    a=${CHECK_ARGV[$i]}
+    if [[ $a == /* ]]; then
+      if [[ -e $a ]]; then
+        assert_trusted_program "$a" "the file $a given to the check"
+        CHECK_ARGV[i]=$VETTED
+      fi
+    elif [[ $a == ./* || $a == ../* ]] || { [[ $a != *://* ]] && [[ -e $a ]]; }; then
+      die "the check argument '$a' names a file relative to the current folder; use an absolute path"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- store
+
+require_store() {
+  [[ -d $SVC_STORE ]] || die "no pass store at $(tildify "$SVC_STORE") ($SVC_STORE_ORIGIN). Create one with: pass init <your-gpg-key-id>"
+}
+
+entry_names() {
+  local base=$SVC_STORE/${SVC_PREFIX%/}
+  [[ -d $base ]] || return 0
+  { (cd "$base" && find . -type f -name '*.gpg' 2>/dev/null) || true; } |
+    sed -e 's|^\./||' -e 's|\.gpg$||' | LC_ALL=C sort
+}
+
+require_entry() {
+  local name=$1 avail
+  if [[ ! -f $SVC_STORE/$SVC_PREFIX$name.gpg ]]; then
+    avail=$(entry_names | tr '\n' ' ' || true)
+    die "no key named '$name' for service '$SVC_NAME' (looked for $(tildify "$SVC_STORE/$SVC_PREFIX$name.gpg")). Available: ${avail:-none}"
+  fi
+}
+
+# Decrypt ENTRY with pass and keep its first line (pass's convention for the secret).
+get_secret() {
+  local out
+  if [[ -z ${GPG_TTY:-} && -t 0 ]]; then
+    GPG_TTY=$(tty) && export GPG_TTY
+  fi
+  out=$(PASSWORD_STORE_DIR=$SVC_STORE "$PASS_BIN" show "$1" 9>&-) || die "pass could not decrypt '$1'"
+  SECRET=${out%%$'\n'*}
+  SECRET=${SECRET%$'\r'}
+  [[ -n $SECRET ]] || die "'$1' is empty (pass keeps the secret on the first line)"
+}
+
+# ---------------------------------------------------------------- state
+
+write_state() {
+  local h fp now
+  h=$(hint_of "$2")
+  fp=$(fingerprint "$2")
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  atomic_write "$SVC_STATE" "$(printf 'entry=%s\nhint=%s\nfingerprint=%s\nswitched=%s' "$1" "$h" "$fp" "$now")"
+}
+
+read_state() {
+  local line
+  ST_ENTRY=''
+  ST_HINT=''
+  ST_FP=''
+  ST_TIME=''
+  [[ -f $SVC_STATE ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      entry=*) ST_ENTRY=${line#entry=} ;;
+      hint=*) ST_HINT=${line#hint=} ;;
+      fingerprint=*) ST_FP=${line#fingerprint=} ;;
+      switched=*) ST_TIME=${line#switched=} ;;
+    esac
+  done < "$SVC_STATE"
+  [[ -n $ST_ENTRY ]]
+}
+
+read_target_key() {
+  TARGET_KEY=''
+  [[ -f $SVC_TARGET && -r $SVC_TARGET ]] || return 1
+  IFS= read -r TARGET_KEY < "$SVC_TARGET" || [[ -n $TARGET_KEY ]] || return 1
+  TARGET_KEY=${TARGET_KEY%$'\r'}
+  [[ -n $TARGET_KEY ]]
+}
+
+# Sets ACTIVE to the entry in use, or leaves it empty and says why in ACTIVE_NOTE.
+find_active() {
+  ACTIVE=''
+  ACTIVE_NOTE=''
+  if ! read_target_key; then
+    ACTIVE_NOTE="there is no key file at $(tildify "$SVC_TARGET")"
+    return 0
+  fi
+  if ! read_state; then
+    ACTIVE_NOTE="$(tildify "$SVC_TARGET") was not written by $PROG"
+    return 0
+  fi
+  if [[ $(fingerprint "$TARGET_KEY") != "$ST_FP" ]]; then
+    ACTIVE_NOTE="$(tildify "$SVC_TARGET") was changed after $PROG wrote '$ST_ENTRY' to it"
+    return 0
+  fi
+  ACTIVE=$ST_ENTRY
+}
+
+# ---------------------------------------------------------------- check
+
+# Serialize switches of one service where flock exists (Linux); released on exit.
+take_lock() {
+  local rc=0
+  if ! command -v flock >/dev/null 2>&1; then return 0; fi
+  exec 9>"$STATE_DIR/$SVC_NAME.lock"
+  flock -w 30 9 || rc=$?
+  case $rc in
+    0) ;;
+    1) die "another $PROG is switching '$SVC_NAME' right now; try again" ;;
+    *) warn "could not lock $(tildify "$STATE_DIR/$SVC_NAME.lock") (flock exit $rc); continuing without a lock" ;;
+  esac
+}
+
+# Run the service's check with KEY on stdin (never on a command line).
+# Returns 0 accepted, 1 rejected, 3 could not check. Its output goes to stderr.
+check_key() {
+  local rc
+  if printf '%s\n' "$1" | KEYSWITCH_SERVICE=$SVC_NAME "${CHECK_ARGV[@]}" >&2 9>&-; then
+    rc=0
+  else
+    rc=${PIPESTATUS[1]}
+  fi
+  case $rc in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 3 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_use() {
+  local name=$1 key h rc
+  valid_entry_path "$name" || usage_error "bad key name '$name'"
+  setup_service
+  resolve_pass
+  require_store
+  require_entry "$name"
+  if [[ -n $SVC_CHECK ]]; then vet_check; fi
+  # Settle everything that could fail before the key file changes.
+  ensure_private_dir "$STATE_DIR" "state folder"
+  ensure_private_dir "$(dirname -- "$SVC_TARGET")" "folder"
+  take_lock
+  get_secret "$SVC_PREFIX$name"
+  key=$SECRET
+  SECRET=''
+  if [[ -n $SVC_CHECK ]]; then
+    if check_key "$key"; then rc=0; else rc=$?; fi
+    case $rc in
+      0) ;;
+      1) die "the check rejected '$name'; nothing changed" ;;
+      *)
+        if (( OPT_ALLOW_UNCHECKED )); then
+          warn "could not check '$name'; switching anyway (--allow-unchecked)"
+        else
+          die "could not check '$name' (see above); nothing changed. To switch anyway: $PROG use $name --allow-unchecked"
+        fi
+        ;;
+    esac
+  fi
+  if [[ -L $SVC_TARGET ]]; then
+    warn "$(tildify "$SVC_TARGET") was a symlink; replacing the link with a regular file (whatever it pointed to is untouched)"
+  fi
+  atomic_write "$SVC_TARGET" "$key"
+  write_state "$name" "$key"
+  h=$(hint_of "$key")
+  say "✓ $SVC_NAME: now using '$name'${h:+ ($h)} → $(tildify "$SVC_TARGET")"
+  if [[ -n $SVC_MESSAGE ]]; then say "$SVC_MESSAGE"; fi
+}
+
+# Read a new key: hidden from the terminal, or the first line of stdin.
+# Leading and trailing spaces are dropped (they are paste accidents).
+read_new_key() {
+  local line=''
+  if [[ -t 0 ]]; then
+    printf 'Key for %s (input hidden): ' "$1" >&2
+    IFS= read -rs line || true
+    printf '\n' >&2
+  else
+    IFS= read -r line || true
+  fi
+  line=${line%$'\r'}
+  SECRET=$(trim "$line")
+  [[ -n $SECRET ]] || die "no key given"
+}
+
+# Check a new key, store it in pass and, with --use, start using it right away
+# from the plaintext already in hand, so no passphrase is needed.
+cmd_add() {
+  local name=$1 key h rc entry
+  valid_entry_path "$name" || usage_error "bad key name '$name'"
+  setup_service
+  resolve_pass
+  require_store
+  [[ -f $SVC_STORE/.gpg-id ]] || die "the pass store at $(tildify "$SVC_STORE") is not set up yet; run: pass init <your-gpg-key-id>"
+  entry=$SVC_PREFIX$name
+  if [[ -f $SVC_STORE/$entry.gpg ]] && (( ! OPT_FORCE )); then
+    die "'$name' already exists for service '$SVC_NAME'; add --force to replace it"
+  fi
+  if [[ -n $SVC_CHECK ]]; then vet_check; fi
+  if (( OPT_USE )); then
+    ensure_private_dir "$STATE_DIR" "state folder"
+    ensure_private_dir "$(dirname -- "$SVC_TARGET")" "folder"
+  fi
+  read_new_key "$name"
+  key=$SECRET
+  SECRET=''
+  # Lock only after the key is typed, so a forgotten prompt blocks nobody.
+  if (( OPT_USE )); then take_lock; fi
+  if [[ -n $SVC_CHECK ]]; then
+    if check_key "$key"; then rc=0; else rc=$?; fi
+    case $rc in
+      0) ;;
+      1) die "the check rejected this key; nothing was stored" ;;
+      *)
+        if (( OPT_ALLOW_UNCHECKED )); then
+          warn "could not check the key; storing it anyway (--allow-unchecked)"
+        else
+          die "could not check the key (see above); nothing was stored. To store it anyway, add --allow-unchecked"
+        fi
+        ;;
+    esac
+  fi
+  if ! printf '%s\n' "$key" | PASSWORD_STORE_DIR=$SVC_STORE "$PASS_BIN" insert -m -f "$entry" >/dev/null 9>&-; then
+    die "pass could not store '$entry'"
+  fi
+  h=$(hint_of "$key")
+  if (( OPT_USE )); then
+    if [[ -L $SVC_TARGET ]]; then
+      warn "$(tildify "$SVC_TARGET") was a symlink; replacing the link with a regular file (whatever it pointed to is untouched)"
+    fi
+    atomic_write "$SVC_TARGET" "$key"
+    write_state "$name" "$key"
+    say "✓ $SVC_NAME: stored '$name'${h:+ ($h)} and now using it → $(tildify "$SVC_TARGET")"
+    if [[ -n $SVC_MESSAGE ]]; then say "$SVC_MESSAGE"; fi
+  else
+    say "✓ $SVC_NAME: stored '$name'${h:+ ($h)}. Start using it with: $PROG use $name"
+  fi
+}
+
+cmd_current() {
+  setup_service
+  find_active
+  if [[ -n $ACTIVE ]]; then
+    say "$ACTIVE"
+    return 0
+  fi
+  err "$SVC_NAME: no active key: $ACTIVE_NOTE"
+  return 1
+}
+
+list_one() {
+  local indent=$1 name any=0 mark h
+  setup_service
+  if [[ ! -d $SVC_STORE ]]; then
+    say "${indent}(no pass store at $(tildify "$SVC_STORE"); create one with: pass init <your-gpg-key-id>)"
+    return 0
+  fi
+  find_active
+  while IFS= read -r name; do
+    any=1
+    if [[ $name == "$ACTIVE" ]]; then mark='*'; h=$ST_HINT; else mark=' '; h=''; fi
+    printf '%s%s %-24s %s\n' "$indent" "$mark" "$name" "$h"
+  done < <(entry_names)
+  if (( ! any )); then
+    say "${indent}(no keys yet; add one with: pass insert $SVC_PREFIX<name>)"
+  elif [[ -z $ACTIVE ]]; then
+    say "${indent}(none in use: $ACTIVE_NOTE)"
+  fi
+}
+
+cmd_list() {
+  local -a svcs=()
+  local s
+  load_global
+  if [[ -z $OPT_SERVICE && -z ${KEYSWITCH_SERVICE:-} && -z $GLOBAL_DEFAULT_SERVICE ]]; then
+    while IFS= read -r s; do svcs+=("$s"); done < <(list_services)
+  fi
+  if (( ${#svcs[@]} > 1 )); then
+    for s in "${svcs[@]}"; do
+      OPT_SERVICE=$s
+      say "$s:"
+      list_one "  "
+    done
+  else
+    list_one ""
+  fi
+}
+
+cmd_test() {
+  local name=$1 key label rc
+  setup_service
+  [[ -n $SVC_CHECK ]] || die "service '$SVC_NAME' has no 'check' in $(tildify "$SVC_FILE")"
+  vet_check
+  if [[ -n $name ]]; then
+    valid_entry_path "$name" || usage_error "bad key name '$name'"
+    resolve_pass
+    require_store
+    require_entry "$name"
+    get_secret "$SVC_PREFIX$name"
+    key=$SECRET
+    SECRET=''
+    label="'$name'"
+  else
+    read_target_key || die "nothing to test: there is no key file at $(tildify "$SVC_TARGET")"
+    key=$TARGET_KEY
+    find_active
+    label="the key in use"
+    if [[ -n $ACTIVE ]]; then label+=" ('$ACTIVE')"; fi
+  fi
+  if check_key "$key"; then rc=0; else rc=$?; fi
+  case $rc in
+    0) say "✓ $SVC_NAME: $label accepted" ;;
+    1) say "✗ $SVC_NAME: $label rejected" ;;
+    *) say "? $SVC_NAME: could not check $label" ;;
+  esac
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- doctor
+
+# Print what a probe wrote to stderr: errors as ✗ lines, warnings as ! lines.
+show_stderr() {
+  local line
+  while IFS= read -r line; do
+    case $line in
+      *": warning: "*) say "! ${line#*: warning: }" ;;
+      "$PROG: "*) say "✗ ${line#"$PROG: "}" ;;
+      *) say "  $line" ;;
+    esac
+  done < "$1"
+}
+
+# Each probe runs in a subshell so one broken setting cannot hide the others.
+probe_pass() {
+  local v
+  resolve_pass
+  v=$("$PASS_BIN" --version 2>/dev/null 9>&- | grep -o 'v[0-9][0-9.]*' | head -n 1 || true)
+  printf '%s\t%s\t%s' "$(tildify "$PASS_BIN")" "$PASS_ORIGIN" "${v:-version unknown}"
+}
+
+probe_service() {
+  local n mode d msg
+  setup_service
+  printf '  %-9s %-40s %s\n' store "$(tildify "$SVC_STORE")" "$SVC_STORE_ORIGIN"
+  if [[ ! -d $SVC_STORE ]]; then
+    echo "PROBLEM no pass store at $(tildify "$SVC_STORE"); create one with: pass init <your-gpg-key-id>"
+  elif [[ ! -f $SVC_STORE/.gpg-id ]]; then
+    echo "PROBLEM $(tildify "$SVC_STORE") has no .gpg-id; run: pass init <your-gpg-key-id>"
+  fi
+  n=$(entry_names | wc -l | tr -d ' ')
+  printf '  %-9s %-40s %s\n' entries "$SVC_PREFIX" "$n key(s)"
+  if [[ -L $SVC_TARGET ]]; then
+    printf '  %-9s %-40s %s\n' target "$(tildify "$SVC_TARGET")" "symlink (replaced on the next 'use')"
+  elif [[ -f $SVC_TARGET ]]; then
+    mode=$(mode_and_owner "$SVC_TARGET")
+    mode=${mode% *}
+    printf '  %-9s %-40s %s\n' target "$(tildify "$SVC_TARGET")" "mode $mode"
+    if (( 8#$mode & 8#077 )); then
+      echo "PROBLEM $(tildify "$SVC_TARGET") is readable by others (mode $mode); fix: chmod 600 '$SVC_TARGET'"
+    fi
+  else
+    printf '  %-9s %-40s %s\n' target "$(tildify "$SVC_TARGET")" "not written yet"
+  fi
+  for d in "$(dirname -- "$SVC_TARGET")" "$STATE_DIR"; do
+    if [[ -d $d ]]; then
+      if ! msg=$( (assert_private "$d" "folder") 2>&1 ); then echo "PROBLEM ${msg#"$PROG: "}"; fi
+    elif [[ -e $d ]]; then
+      echo "PROBLEM $(tildify "$d") exists but is not a folder"
+    fi
+  done
+  printf '  %-9s %s\n' check "${SVC_CHECK:-(none)}"
+  if [[ -n $SVC_CHECK ]]; then
+    if ! msg=$( (vet_check) 2>&1 ); then
+      echo "PROBLEM ${msg#"$PROG: "}"
+    elif [[ -n $msg ]]; then
+      echo "! ${msg#*: warning: }"
+    fi
+  fi
+  find_active
+  if [[ -n $ACTIVE ]]; then
+    printf '  %-9s %-40s %s\n' active "$ACTIVE${ST_HINT:+ $ST_HINT}" "since $ST_TIME"
+  else
+    printf '  %-9s %s\n' active "none ($ACTIVE_NOTE)"
+  fi
+}
+
+cmd_doctor() {
+  local problems=0 out errf a b c s line
+  local -a svcs=()
+  errf=$(mktemp)
+  CLEANUP+=("$errf")
+
+  say "$PROG $KEYSWITCH_VERSION"
+  printf '  %-9s %-40s %s\n' config "$(tildify "$CONFIG_DIR")" "$CONFIG_DIR_ORIGIN"
+  printf '  %-9s %-40s %s\n' state "$(tildify "$STATE_DIR")" "$STATE_DIR_ORIGIN"
+
+  # A broken main config breaks everything after it, so report it once and stop.
+  if ! (load_global) 2>"$errf"; then
+    show_stderr "$errf"
+    say "1 problem(s) found"
+    return 1
+  fi
+  show_stderr "$errf"
+  if out=$( (load_global; printf '%s' "${TRUSTED_DIRS[*]+"${TRUSTED_DIRS[*]}"}") 2>/dev/null ) && [[ -n $out ]]; then
+    printf '  %-9s %s\n' trusted "$out"
+  fi
+  if out=$( (probe_pass) 2>"$errf" ); then
+    IFS=$'\t' read -r a b c <<<"$out"
+    printf '  %-9s %-40s %s\n' pass "$a" "$b · $c"
+  else
+    show_stderr "$errf"
+    problems=$((problems + 1))
+  fi
+
+  if [[ -n $OPT_SERVICE ]]; then
+    svcs=("$OPT_SERVICE")
+  else
+    while IFS= read -r s; do svcs+=("$s"); done < <(list_services)
+  fi
+  if (( ${#svcs[@]} == 0 )); then
+    say "✗ no services configured yet: create $(tildify "$CONFIG_DIR")/NAME.conf"
+    problems=$((problems + 1))
+  fi
+  for s in "${svcs[@]+"${svcs[@]}"}"; do
+    say "service '$s' ($(tildify "$CONFIG_DIR/$s.conf"))"
+    if out=$( (OPT_SERVICE=$s; probe_service) 2>"$errf" ); then
+      show_stderr "$errf"
+      while IFS= read -r line; do
+        if [[ $line == PROBLEM\ * ]]; then
+          say "✗ ${line#PROBLEM }"
+          problems=$((problems + 1))
+        else
+          say "$line"
+        fi
+      done <<<"$out"
+    else
+      show_stderr "$errf"
+      problems=$((problems + 1))
+    fi
+  done
+
+  if (( problems )); then
+    say "$problems problem(s) found"
+    return 1
+  fi
+  say "✓ no problems found"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  local -a args=()
+  local cmd
+  OPT_SERVICE=''
+  OPT_ALLOW_UNCHECKED=0
+  OPT_FORCE=0
+  OPT_USE=0
+  while (( $# )); do
+    case $1 in
+      -s|--service)
+        [[ $# -ge 2 ]] || usage_error "$1 needs a NAME"
+        OPT_SERVICE=$2
+        shift 2
+        ;;
+      --service=*) OPT_SERVICE=${1#*=}; shift ;;
+      --allow-unchecked) OPT_ALLOW_UNCHECKED=1; shift ;;
+      --force) OPT_FORCE=1; shift ;;
+      --use) OPT_USE=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -V|--version) say "$PROG $KEYSWITCH_VERSION"; exit 0 ;;
+      --) shift; args+=("$@"); break ;;
+      -*) usage_error "unknown option '$1'" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- "${args[@]+"${args[@]}"}"
+  if (( $# == 0 )); then
+    usage >&2
+    exit 2
+  fi
+  cmd=$1
+  shift
+  if (( OPT_ALLOW_UNCHECKED )) && [[ $cmd != use && $cmd != add ]]; then usage_error "--allow-unchecked only applies to 'use' and 'add'"; fi
+  if (( OPT_FORCE || OPT_USE )) && [[ $cmd != add ]]; then usage_error "--force and --use only apply to 'add'"; fi
+  init_dirs
+  case $cmd in
+    list|ls)
+      (( $# == 0 )) || usage_error "'list' takes no arguments"
+      cmd_list
+      ;;
+    use)
+      (( $# == 1 )) || usage_error "usage: $PROG use NAME"
+      cmd_use "$1"
+      ;;
+    add)
+      (( $# == 1 )) || usage_error "usage: $PROG add NAME [--force] [--use]"
+      cmd_add "$1"
+      ;;
+    current)
+      (( $# == 0 )) || usage_error "'current' takes no arguments"
+      cmd_current
+      ;;
+    test)
+      (( $# <= 1 )) || usage_error "usage: $PROG test [NAME]"
+      cmd_test "${1:-}"
+      ;;
+    doctor)
+      (( $# == 0 )) || usage_error "'doctor' takes no arguments"
+      cmd_doctor
+      ;;
+    help) usage ;;
+    *) usage_error "unknown command '$cmd'" ;;
+  esac
+}
+
+main "$@"

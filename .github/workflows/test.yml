@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pass, GnuPG and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y pass gnupg tree shellcheck
+      - run: make lint
+      - run: make test
+
+  # Same family as the RHEL 8 hosts keyswitch was first written for.
+  rocky8:
+    runs-on: ubuntu-latest
+    container: rockylinux:8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pass and GnuPG from EPEL
+        run: dnf install -y epel-release && dnf install -y pass gnupg2 tree python3 make findutils util-linux
+      # Run as an ordinary user: as root, permission checks would pass trivially.
+      - name: Test as a non-root user
+        run: |
+          useradd -m tester
+          chown -R tester .
+          runuser -u tester -- make test
